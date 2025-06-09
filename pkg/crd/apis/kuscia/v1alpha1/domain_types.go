@@ -114,6 +114,12 @@ type NodeStatus struct {
 	LastHeartbeatTime metav1.Time `json:"lastHeartbeatTime,omitempty"`
 	// +optional
 	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	UnreadyReason string `json:"unreadyReason,omitempty"`
+
+	TotalCPURequest int64 `json:"totalCPURequest"`
+
+	TotalMemRequest int64 `json:"totalMemRequest"`
 }
 
 // DeployTokenStatus defines csr token status under domain.

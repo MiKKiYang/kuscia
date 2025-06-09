@@ -18,6 +18,7 @@ import (
 	"context"
 	"time"
 
+	apicorev1 "k8s.io/api/core/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
@@ -26,6 +27,13 @@ import (
 )
 
 type queueHandler func(ctx context.Context, key string) error
+
+type queuePodHandler func(key *apicorev1.Pod) error
+
+func EnqueuePodObject(pod *apicorev1.Pod, queue workqueue.Interface) {
+	queue.Add(pod)
+	nlog.Infof("Enqueue Pod key: %q", pod.Name)
+}
 
 // EnqueueObjectWithKey is used to enqueue object key.
 func EnqueueObjectWithKey(obj interface{}, queue workqueue.Interface) {
@@ -121,6 +129,53 @@ func HandleQueueItem(ctx context.Context, queueID string, q workqueue.RateLimiti
 
 		// Finally, if no error occurs we Forget this item so it does not get queued again until
 		// another change happens.
+		q.Forget(obj)
+
+		nlog.Infof("Finish processing item: queue id[%v], key[%v] (%v)", queueID, key, time.Since(startTime))
+	}
+	select {
+	case <-ctx.Done():
+		nlog.Warnf("HandleQueueItem quit, because %s", ctx.Err().Error())
+		return false
+	default:
+		run(obj)
+	}
+
+	return true
+}
+
+func HandlePodQueueItem(ctx context.Context, queueID string, q workqueue.RateLimitingInterface, handler queuePodHandler, maxRetries int) bool {
+	defer utilruntime.HandleCrash()
+	obj, shutdown := q.Get()
+	if shutdown {
+		return false
+	}
+	run := func(obj interface{}) {
+		startTime := time.Now()
+		defer q.Done(obj)
+		var key *apicorev1.Pod
+		var ok bool
+
+		if key, ok = obj.(*apicorev1.Pod); !ok {
+			q.Forget(obj)
+			nlog.Warnf("Get obj failed: expected string item in work queue id[%v] but got %#v", queueID, obj)
+			return
+		}
+
+		nlog.Debugf("Start processing item: queue id[%v], key[%v]", queueID, key)
+		if err := handler(key); err != nil {
+			if q.NumRequeues(key) < maxRetries {
+				nlog.Infof("Re-syncing: queue id[%v], retry:[%d] key[%v]: %q, re-queuing (%v)", queueID, q.NumRequeues(key), key, err.Error(), time.Since(startTime))
+				q.AddRateLimited(key)
+				return
+			}
+
+			q.Forget(key)
+			nlog.Errorf("Forgetting: queue id[%v], key[%v] (%v), due to maximum retries[%v] reached, last error: %q",
+				queueID, key, time.Since(startTime), maxRetries, err.Error())
+			return
+		}
+
 		q.Forget(obj)
 
 		nlog.Infof("Finish processing item: queue id[%v], key[%v] (%v)", queueID, key, time.Since(startTime))
