@@ -65,6 +65,11 @@ const (
 )
 
 const (
+	addPod = "add"
+	deletePod = "delete"
+)
+
+const (
 	nodeStatusReady    = "Ready"
 	nodeStatusNotReady = "NotReady"
 )
@@ -88,8 +93,7 @@ type Controller struct {
 	roleLister            rbaclisters.RoleLister
 	podLister			  listerscorev1.PodLister
 	workqueue             workqueue.RateLimitingInterface
-	addPodQueue           workqueue.RateLimitingInterface
-	deletePodQueue        workqueue.RateLimitingInterface
+	podQueue              workqueue.RateLimitingInterface
 	recorder              record.EventRecorder
 	cacheSyncs            []cache.InformerSynced
 }
@@ -134,8 +138,7 @@ func NewController(ctx context.Context, config controllers.ControllerConfig) con
 		configmapLister:       configmapInformer.Lister(),
 		roleLister:            roleInformer.Lister(),
 		workqueue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "domain"),
-		addPodQueue:           workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "add_pod_resource"),
-		deletePodQueue:        workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "delete_pod_resource"),
+		podQueue:              workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "pod"),
 		recorder:              eventRecorder,
 		cacheSyncs:            cacheSyncs,
 	}
@@ -181,21 +184,32 @@ func (c *Controller) handlePodAdd(obj interface{}) {
 		}
 	}
 
-	c.enqueueAddPod(newPod)
+	queue.EnqueuePodObject(&queue.PodQueueItem{Pod: newPod, PodName: newPod.Name, Op: addPod}, c.podQueue)
 }
 
 func (c *Controller) handlePodDelete(obj interface{}) {
-	deletePod, ok := obj.(*apicorev1.Pod)
+	deletedPod, ok := obj.(*apicorev1.Pod)
 	if !ok {
 		if d, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-			if deletePod, ok = d.Obj.(*apicorev1.Pod); !ok {
+			if deletedPod, ok = d.Obj.(*apicorev1.Pod); !ok {
 				nlog.Warnf("Could not convert object %T to Pod", d.Obj)
 				return
 			}
 		}
 	}
 
-	c.enqueueDeletePod(deletePod)
+	queue.EnqueuePodObject(&queue.PodQueueItem{Pod: deletedPod, PodName: deletedPod.Name, Op: deletePod}, c.podQueue)
+}
+
+func (c *Controller) podHandler(item *queue.PodQueueItem) error {
+	switch item.Op {
+	case addPod:
+		return c.addPodHandler(item.Pod)
+	case deletePod:
+		return c.deletePodHandler(item.Pod)
+	default:
+		return fmt.Errorf("unknown operation: %s", item.Op)
+	}
 }
 
 func (c *Controller) addPodHandler(pod *apicorev1.Pod) error {
@@ -427,14 +441,6 @@ func (c *Controller) matchLabels(obj apismetav1.Object) bool {
 	return false
 }
 
-func (c *Controller) enqueueAddPod(pod *apicorev1.Pod) {
-	queue.EnqueuePodObject(pod, c.addPodQueue)
-}
-
-func (c *Controller) enqueueDeletePod(pod *apicorev1.Pod) {
-	queue.EnqueuePodObject(pod, c.deletePodQueue)
-}
-
 // enqueueDomain puts a domain resource onto the workqueue.
 // This method should *not* be passed resources of any type other than domain.
 func (c *Controller) enqueueDomain(obj interface{}) {
@@ -479,8 +485,7 @@ func (c *Controller) Run(workers int) error {
 	nlog.Info("Starting workers")
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, c.ctx.Done())
-		go wait.Until(c.runAddPodWorker, time.Second, c.ctx.Done())
-		go wait.Until(c.runDeletePodWorker, time.Second, c.ctx.Done())
+		go wait.Until(c.runPodHandleWorker, time.Second, c.ctx.Done())
 	}
 
 	nlog.Info("Starting sync domain status")
@@ -505,15 +510,9 @@ func (c *Controller) runWorker() {
 	}
 }
 
-func (c *Controller) runAddPodWorker() {
-	for queue.HandlePodQueueItem(context.Background(), controllerName, c.addPodQueue, c.addPodHandler, maxRetries) {
-		metrics.WorkerQueueSize.Set(float64(c.addPodQueue.Len()))
-	}
-}
-
-func (c *Controller) runDeletePodWorker() {
-	for queue.HandlePodQueueItem(context.Background(), controllerName, c.deletePodQueue, c.deletePodHandler, maxRetries) {
-		metrics.WorkerQueueSize.Set(float64(c.deletePodQueue.Len()))
+func (c *Controller) runPodHandleWorker() {
+	for queue.HandlePodQueueItem(context.Background(), controllerName, c.podQueue, c.podHandler, maxRetries) {
+		metrics.WorkerQueueSize.Set(float64(c.podQueue.Len()))
 	}
 }
 

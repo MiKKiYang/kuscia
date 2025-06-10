@@ -28,11 +28,17 @@ import (
 
 type queueHandler func(ctx context.Context, key string) error
 
-type queuePodHandler func(key *apicorev1.Pod) error
+type queuePodHandler func(key *PodQueueItem) error
 
-func EnqueuePodObject(pod *apicorev1.Pod, queue workqueue.Interface) {
-	queue.Add(pod)
-	nlog.Infof("Enqueue Pod key: %q", pod.Name)
+type PodQueueItem struct {
+	Pod  *apicorev1.Pod
+	PodName string
+	Op   string
+}
+
+func EnqueuePodObject(podQueueItem *PodQueueItem, queue workqueue.Interface) {
+	queue.Add(podQueueItem)
+	nlog.Infof("Enqueue Pod key: %q", podQueueItem.PodName)
 }
 
 // EnqueueObjectWithKey is used to enqueue object key.
@@ -153,12 +159,12 @@ func HandlePodQueueItem(ctx context.Context, queueID string, q workqueue.RateLim
 	run := func(obj interface{}) {
 		startTime := time.Now()
 		defer q.Done(obj)
-		var key *apicorev1.Pod
+		var key *PodQueueItem
 		var ok bool
 
-		if key, ok = obj.(*apicorev1.Pod); !ok {
+		if key, ok = obj.(*PodQueueItem); !ok {
 			q.Forget(obj)
-			nlog.Warnf("Get obj failed: expected string item in work queue id[%v] but got %#v", queueID, obj)
+			nlog.Warnf("Get obj failed: expected PodQueueItem item in work queue id[%v] but got %#v", queueID, obj)
 			return
 		}
 
@@ -182,7 +188,7 @@ func HandlePodQueueItem(ctx context.Context, queueID string, q workqueue.RateLim
 	}
 	select {
 	case <-ctx.Done():
-		nlog.Warnf("HandleQueueItem quit, because %s", ctx.Err().Error())
+		nlog.Warnf("HandlePodQueueItem quit, because %s", ctx.Err().Error())
 		return false
 	default:
 		run(obj)
