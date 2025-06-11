@@ -83,6 +83,10 @@ type Controller struct {
 
 	namespaceLister  corelisters.NamespaceLister
 	namespaceSynced  cache.InformerSynced
+	domainLister     kuscialistersv1alpha1.DomainLister
+	domainSynced     cache.InformerSynced
+	nodeLister       corelisters.NodeLister
+	nodeSynced       cache.InformerSynced
 	podsLister       corelisters.PodLister
 	podsSynced       cache.InformerSynced
 	servicesSynced   cache.InformerSynced
@@ -105,6 +109,8 @@ func NewController(ctx context.Context, config controllers.ControllerConfig) con
 	kusciaInformerFactory := kusciainformers.NewSharedInformerFactory(kusciaClient, 5*time.Minute)
 
 	namespaceInformer := kubeInformerFactory.Core().V1().Namespaces()
+	domainInformer := kusciaInformerFactory.Kuscia().V1alpha1().Domains()
+	nodeInformer := kubeInformerFactory.Core().V1().Nodes()
 	podInformer := kubeInformerFactory.Core().V1().Pods()
 	serviceInformer := kubeInformerFactory.Core().V1().Services()
 	configMapInformer := kubeInformerFactory.Core().V1().ConfigMaps()
@@ -119,6 +125,10 @@ func NewController(ctx context.Context, config controllers.ControllerConfig) con
 		kusciaInformerFactory: kusciaInformerFactory,
 		namespaceLister:       namespaceInformer.Lister(),
 		namespaceSynced:       namespaceInformer.Informer().HasSynced,
+		domainLister:          domainInformer.Lister(),
+		domainSynced:          domainInformer.Informer().HasSynced,
+		nodeLister:            nodeInformer.Lister(),
+		nodeSynced:            nodeInformer.Informer().HasSynced,
 		podsLister:            podInformer.Lister(),
 		podsSynced:            podInformer.Informer().HasSynced,
 		servicesSynced:        serviceInformer.Informer().HasSynced,
@@ -140,6 +150,8 @@ func NewController(ctx context.Context, config controllers.ControllerConfig) con
 		KusciaClient:     kusciaClient,
 		TrgLister:        trgInformer.Lister(),
 		NamespacesLister: namespaceInformer.Lister(),
+		DomainLister:     domainInformer.Lister(),
+		NodeLister:       nodeInformer.Lister(),
 		PodsLister:       controller.podsLister,
 		ServicesLister:   serviceInformer.Lister(),
 		ConfigMapLister:  configMapInformer.Lister(),

@@ -24,6 +24,7 @@ import (
 
 	"google.golang.org/protobuf/encoding/protojson"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -47,6 +48,8 @@ type PendingHandler struct {
 	kusciaClient     kusciaclientset.Interface
 	trgLister        kuscialistersv1alpha1.TaskResourceGroupLister
 	namespacesLister corelisters.NamespaceLister
+	domainLister     kuscialistersv1alpha1.DomainLister
+	nodeLister       corelisters.NodeLister
 	podsLister       corelisters.PodLister
 	servicesLister   corelisters.ServiceLister
 	configMapLister  corelisters.ConfigMapLister
@@ -89,6 +92,8 @@ func NewPendingHandler(deps *Dependencies) *PendingHandler {
 		kusciaClient:     deps.KusciaClient,
 		trgLister:        deps.TrgLister,
 		namespacesLister: deps.NamespacesLister,
+		domainLister:     deps.DomainLister,
+		nodeLister:       deps.NodeLister,
 		podsLister:       deps.PodsLister,
 		servicesLister:   deps.ServicesLister,
 		configMapLister:  deps.ConfigMapLister,
@@ -221,6 +226,12 @@ func (h *PendingHandler) createTaskResources(kusciaTask *kusciaapisv1alpha1.Kusc
 	podStatuses := make(map[string]*kusciaapisv1alpha1.PodStatus)
 	serviceStatuses := make(map[string]*kusciaapisv1alpha1.ServiceStatus)
 	for _, partyKitInfo := range selfPartyKitInfos {
+		_, err := h.nodeResourceCheck(*partyKitInfo)
+		if err != nil {
+			nlog.Errorf("domain %s hv no node can satisfy kt %s", partyKitInfo.domainID, partyKitInfo.kusciaTask.Name)
+			return err
+		}
+
 		ps, ss, err := h.createResourceForParty(partyKitInfo)
 		if err != nil {
 			return fmt.Errorf("failed to create resource for party '%v/%v', %v", partyKitInfo.domainID, partyKitInfo.role, err)
@@ -242,6 +253,40 @@ func (h *PendingHandler) createTaskResources(kusciaTask *kusciaapisv1alpha1.Kusc
 		return fmt.Errorf("failed to create task resource group for kuscia task %v, %v", kusciaTask.Name, err.Error())
 	}
 	return nil
+}
+
+func (h *PendingHandler) nodeResourceCheck(partyKitInfo PartyKitInfo) (bool, error) {
+	var allContainerCPURequest, allContainerMEMRequest int64
+	for _, container := range partyKitInfo.deployTemplate.Spec.Containers {
+		cpuValue := container.Resources.Requests.Cpu().MilliValue()
+		memValue := container.Resources.Requests.Memory().Value()
+		allContainerCPURequest += cpuValue
+		allContainerMEMRequest += memValue
+	}
+
+	domain, err := h.domainLister.Get(partyKitInfo.domainID)
+	if err != nil {
+		return false, fmt.Errorf("get domain %s failed with %v", partyKitInfo.domainID, err)
+	}
+
+	for _, nodeStatus := range domain.Status.NodeStatuses {
+		if nodeStatus.Status == "Ready" {
+			//totalCPURequest := nodeStatus.TotalCPURequest
+			//totalMemRequest := nodeStatus.TotalMemRequest
+			node, err := h.nodeLister.Get(nodeStatus.Name)
+			if err != nil {
+				return false, fmt.Errorf("get node %s failed with %v", nodeStatus.Name, err)
+			}
+
+			nodeCPUValue := node.Status.Allocatable.Cpu().MilliValue()
+			nodeMEMValue := node.Status.Allocatable.Memory().Value()
+			if nodeCPUValue > allContainerCPURequest && nodeMEMValue > allContainerMEMRequest {
+				return true, nil
+			}
+		}
+	}
+
+	return false, fmt.Errorf("domain %s hv no node can satisfy kt %s", partyKitInfo.domainID, partyKitInfo.kusciaTask.Name)
 }
 
 func (h *PendingHandler) initPartyTaskStatus(kusciaTask *kusciaapisv1alpha1.KusciaTask, ktStatus *kusciaapisv1alpha1.KusciaTaskStatus) {
