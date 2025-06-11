@@ -258,6 +258,9 @@ func (h *PendingHandler) createTaskResources(kusciaTask *kusciaapisv1alpha1.Kusc
 func (h *PendingHandler) nodeResourceCheck(partyKitInfo PartyKitInfo) (bool, error) {
 	var allContainerCPURequest, allContainerMEMRequest int64
 	for _, container := range partyKitInfo.deployTemplate.Spec.Containers {
+		if container.Resources.Requests == nil {
+			return false, fmt.Errorf("kt %s container %s hv no requests settings", partyKitInfo.kusciaTask.Name, container.Name)
+		}
 		cpuValue := container.Resources.Requests.Cpu().MilliValue()
 		memValue := container.Resources.Requests.Memory().Value()
 		allContainerCPURequest += cpuValue
@@ -271,8 +274,6 @@ func (h *PendingHandler) nodeResourceCheck(partyKitInfo PartyKitInfo) (bool, err
 
 	for _, nodeStatus := range domain.Status.NodeStatuses {
 		if nodeStatus.Status == "Ready" {
-			//totalCPURequest := nodeStatus.TotalCPURequest
-			//totalMemRequest := nodeStatus.TotalMemRequest
 			node, err := h.nodeLister.Get(nodeStatus.Name)
 			if err != nil {
 				return false, fmt.Errorf("get node %s failed with %v", nodeStatus.Name, err)
@@ -280,7 +281,8 @@ func (h *PendingHandler) nodeResourceCheck(partyKitInfo PartyKitInfo) (bool, err
 
 			nodeCPUValue := node.Status.Allocatable.Cpu().MilliValue()
 			nodeMEMValue := node.Status.Allocatable.Memory().Value()
-			if nodeCPUValue > allContainerCPURequest && nodeMEMValue > allContainerMEMRequest {
+			if (nodeCPUValue - nodeStatus.TotalCPURequest) > allContainerCPURequest &&
+				(nodeMEMValue - nodeStatus.TotalMemRequest) > allContainerMEMRequest {
 				return true, nil
 			}
 		}
