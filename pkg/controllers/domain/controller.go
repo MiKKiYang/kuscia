@@ -22,11 +22,10 @@ import (
 
 	apicorev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apismetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/apimachinery/pkg/labels"
 	kubeinformers "k8s.io/client-go/informers"
 	informerscorev1 "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
@@ -79,19 +78,6 @@ const (
 	nodeStatusNotReady = "NotReady"
 )
 
-type LocalNodeStatuses []LocalNodeStatus
-
-type LocalNodeStatus struct {
-	Name    string `json:"name"`
-	DomainName string `json:"domainName"`
-	Status  string `json:"status"`
-	LastHeartbeatTime metav1.Time `json:"lastHeartbeatTime,omitempty"`
-	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
-	UnreadyReason string `json:"unreadyReason,omitempty"`
-	TotalCPURequest int64 `json:"totalCPURequest"`
-	TotalMemRequest int64 `json:"totalMemRequest"`
-}
-
 // Controller is the implementation for managing domain resources.
 type Controller struct {
 	ctx                   context.Context
@@ -115,7 +101,7 @@ type Controller struct {
 	nodeQueue	          workqueue.RateLimitingInterface
 	recorder              record.EventRecorder
 	cacheSyncs            []cache.InformerSynced
-	nodeStatuses          LocalNodeStatuses
+	nodeStatuses          common.LocalNodeStatuses
 	nodeStatusesLock      sync.RWMutex
 }
 
@@ -607,7 +593,7 @@ func (c *Controller) initLocalNodeStatus() error {
             }
         }
 
-		status := LocalNodeStatus{
+		status := common.LocalNodeStatus{
             Name:          nodeObj.Name,
             DomainName:    domainName,
             TotalCPURequest: totalCPU,
