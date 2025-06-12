@@ -34,24 +34,21 @@ type queueNodeHandler func(key *NodeQueueItem) error
 
 type PodQueueItem struct {
 	Pod  *apicorev1.Pod
-	PodName string
 	Op   string
 }
 
 type NodeQueueItem struct {
 	Node  *apicorev1.Node
-	Name   string
-	Domain string
 }
 
 func EnqueuePodObject(podQueueItem *PodQueueItem, queue workqueue.Interface) {
 	queue.Add(podQueueItem)
-	nlog.Infof("Enqueue Pod key: %q", podQueueItem.PodName)
+	nlog.Infof("Enqueue Pod key: %s", podQueueItem.Pod.Name)
 }
 
 func EnqueueNodeObject(nodeQueueItem *NodeQueueItem, queue workqueue.Interface) {
 	queue.Add(nodeQueueItem)
-	nlog.Infof("Enqueue Node key: %q", nodeQueueItem.Domain)
+	nlog.Infof("Enqueue Node key: %s", nodeQueueItem.Node.Name)
 }
 
 // EnqueueObjectWithKey is used to enqueue object key.

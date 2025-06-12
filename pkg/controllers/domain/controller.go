@@ -17,11 +17,12 @@ package domain
 import (
 	"context"
 	"fmt"
-	"github.com/docker/cli/cli/command/node"
+	"sync"
 	"time"
 
 	apicorev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	apismetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -78,6 +79,19 @@ const (
 	nodeStatusNotReady = "NotReady"
 )
 
+type LocalNodeStatuses []LocalNodeStatus
+
+type LocalNodeStatus struct {
+	Name    string `json:"name"`
+	DomainName string `json:"domainName"`
+	Status  string `json:"status"`
+	LastHeartbeatTime metav1.Time `json:"lastHeartbeatTime,omitempty"`
+	LastTransitionTime metav1.Time `json:"lastTransitionTime,omitempty"`
+	UnreadyReason string `json:"unreadyReason,omitempty"`
+	TotalCPURequest int64 `json:"totalCPURequest"`
+	TotalMemRequest int64 `json:"totalMemRequest"`
+}
+
 // Controller is the implementation for managing domain resources.
 type Controller struct {
 	ctx                   context.Context
@@ -101,6 +115,8 @@ type Controller struct {
 	nodeQueue	          workqueue.RateLimitingInterface
 	recorder              record.EventRecorder
 	cacheSyncs            []cache.InformerSynced
+	nodeStatuses          LocalNodeStatuses
+	nodeStatusesLock      sync.RWMutex
 }
 
 // NewController returns a controller instance.
@@ -193,9 +209,9 @@ func (c *Controller) addPodEventHandler(podInformer informerscorev1.PodInformer)
 func (c *Controller) addNodeEventHandler(nodeInformer informerscorev1.NodeInformer) {
 	_, _ = nodeInformer.Informer().AddEventHandler(cache.FilteringResourceEventHandler{
 		FilterFunc: func(obj interface{}) bool {
-			node, ok := obj.(*apicorev1.Node)
+			nodeObj, ok := obj.(*apicorev1.Node)
 			if ok {
-				if c.matchNodeLabels(node) {
+				if c.matchNodeLabels(nodeObj) {
 					return true
 				}
 			}
@@ -235,8 +251,7 @@ func (c *Controller) handleNodeCommon(obj interface{}, op string) {
 		}
 	}
 
-	value, _ := newNode.GetLabels()[common.LabelNodeNamespace]
-	queue.EnqueueNodeObject(&queue.NodeQueueItem{Node: newNode, Domain: value}, c.nodeQueue)
+	queue.EnqueueNodeObject(&queue.NodeQueueItem{Node: newNode}, c.nodeQueue)
 }
 
 func (c *Controller) handlePodAdd(obj interface{}) {
@@ -261,44 +276,36 @@ func (c *Controller) handlePodCommon(obj interface{}, op string)  {
 		}
 	}
 
-	queue.EnqueuePodObject(&queue.PodQueueItem{Pod: Pod, PodName: Pod.Name, Op: op}, c.podQueue)
+	queue.EnqueuePodObject(&queue.PodQueueItem{Pod: Pod, Op: op}, c.podQueue)
 }
 
 func (c *Controller) nodeHandler(item *queue.NodeQueueItem) error {
-	domain, err := c.domainLister.Get(item.Domain)
-	if err != nil {
-		return fmt.Errorf("get domain %s fail: %v", item.Domain, err.Error())
-	}
+	c.nodeStatusesLock.Lock()
+	defer c.nodeStatusesLock.Unlock()
 
-	newDomain := domain.DeepCopy()
-	for i := range newDomain.Status.NodeStatuses {
-		nodeStatus := &newDomain.Status.NodeStatuses[i]
-		if nodeStatus.Name == item.Name {
+	for i := range c.nodeStatuses {
+		if c.nodeStatuses[i].Name == item.Node.Name {
 			for _, cond := range item.Node.Status.Conditions {
 				if cond.Type == apicorev1.NodeReady {
 					switch cond.Status {
 					case apicorev1.ConditionTrue:
-						nodeStatus.Status = nodeStatusReady
+						c.nodeStatuses[i].Status = nodeStatusReady
 					default:
-						nodeStatus.Status = nodeStatusNotReady
+						c.nodeStatuses[i].Status = nodeStatusNotReady
 						for _, condReason := range item.Node.Status.Conditions {
 							if condReason.Status == apicorev1.ConditionTrue {
-								nodeStatus.UnreadyReason = string(condReason.Type)
+								c.nodeStatuses[i].UnreadyReason = string(condReason.Type)
 							}
 							break
 						}
 					}
-					nodeStatus.LastHeartbeatTime = cond.LastHeartbeatTime
-					nodeStatus.LastTransitionTime = cond.LastTransitionTime
+					c.nodeStatuses[i].LastHeartbeatTime = cond.LastHeartbeatTime
+					c.nodeStatuses[i].LastTransitionTime = cond.LastTransitionTime
 					break
 				}
 			}
-			break
+			return nil
 		}
-	}
-
-	if err := c.updateDomainStatus(newDomain); err != nil {
-		return fmt.Errorf("update domain status failed: %v", err)
 	}
 	return nil
 }
@@ -315,47 +322,33 @@ func (c *Controller) podHandler(item *queue.PodQueueItem) error {
 }
 
 func (c *Controller) addPodHandler(pod *apicorev1.Pod) error {
-	nodeName := pod.Spec.NodeName
-	namespace := pod.Namespace
-	domain, _ := c.domainLister.Get(namespace)
+	cpuReq, memReq := c.calRequestResource(pod)
+	c.nodeStatusesLock.Lock()
+	defer c.nodeStatusesLock.Unlock()
 
-	newDomain := domain.DeepCopy()
-	for i := range newDomain.Status.NodeStatuses {
-		nodeStatus := &newDomain.Status.NodeStatuses[i]
-		if nodeStatus.Name == nodeName {
-			if nodeStatus.TotalCPURequest == 0 {
-				c.initNodeStatus(namespace, nodeName, nodeStatus)
-			} else {
-				requestCPURequest, requestMEMRequest := c.calRequestResource(pod)
-				nodeStatus.TotalCPURequest += requestCPURequest
-				nodeStatus.TotalMemRequest += requestMEMRequest
-			}
-			break
+	for i := range c.nodeStatuses {
+		if c.nodeStatuses[i].Name == pod.Spec.NodeName {
+			c.nodeStatuses[i].TotalCPURequest += cpuReq
+			c.nodeStatuses[i].TotalMemRequest += memReq
+			return nil
 		}
 	}
-	return c.updateDomainStatus(newDomain)
+	return nil
 }
 
 func (c *Controller) deletePodHandler(pod *apicorev1.Pod) error {
-	nodeName := pod.Spec.NodeName
-	namespace := pod.Namespace
-	domain, _ := c.domainLister.Get(namespace)
+	cpuReq, memReq := c.calRequestResource(pod)
+	c.nodeStatusesLock.Lock()
+	defer c.nodeStatusesLock.Unlock()
 
-	newDomain := domain.DeepCopy()
-	for i := range newDomain.Status.NodeStatuses {
-		nodeStatus := &newDomain.Status.NodeStatuses[i]
-		if nodeStatus.Name == nodeName {
-			if nodeStatus.TotalCPURequest == 0 {
-				c.initNodeStatus(namespace, nodeName, nodeStatus)
-			} else {
-				requestCPURequest, requestMEMRequest := c.calRequestResource(pod)
-				nodeStatus.TotalCPURequest -= requestCPURequest
-				nodeStatus.TotalMemRequest -= requestMEMRequest
-			}
-			break
+	for i := range c.nodeStatuses {
+		if c.nodeStatuses[i].Name == pod.Spec.NodeName {
+			c.nodeStatuses[i].TotalCPURequest -= cpuReq
+			c.nodeStatuses[i].TotalMemRequest -= memReq
+			return nil
 		}
 	}
-	return c.updateDomainStatus(newDomain)
+	return nil
 }
 
 func (c * Controller) calRequestResource(pod *apicorev1.Pod) (int64, int64) {
@@ -366,27 +359,6 @@ func (c * Controller) calRequestResource(pod *apicorev1.Pod) (int64, int64) {
 	}
 
 	return requestCPURequest, requestMEMRequest
-}
-
-func (c *Controller) initNodeStatus(namespace, nodeName string, nodeStatus *kusciaapisv1alpha1.NodeStatus) {
-	pods, err := c.podLister.Pods(namespace).List(labels.Everything())
-	if err != nil {
-		nlog.Errorf("List %s's pods failed with %v", namespace, err)
-		return
-	}
-
-	var totalCpuRequest, totalMemRequest int64
-	for _, pod := range pods {
-		if pod.Spec.NodeName == nodeName {
-			for _, container := range pod.Spec.Containers {
-				totalCpuRequest += container.Resources.Requests.Cpu().MilliValue()
-				totalMemRequest += container.Resources.Requests.Memory().Value()
-			}
-		}
-	}
-
-	nodeStatus.TotalCPURequest = totalCpuRequest
-	nodeStatus.TotalMemRequest = totalMemRequest
 }
 
 // addNamespaceEventHandler is used to add event handler for namespace informer.
@@ -522,9 +494,19 @@ func (c *Controller) addConfigMapHandler(cmInformer informerscorev1.ConfigMapInf
 func (c *Controller) matchNodeLabels(obj *apicorev1.Node) bool {
 	if objLabels := obj.GetLabels(); objLabels != nil {
 		if value, exists := objLabels[common.LabelNodeNamespace]; exists {
-			return value != ""
+			if value != "" {
+				_, err := c.domainLister.Get(value)
+				if err != nil {
+					nlog.Errorf("get domain by node %s failed with %v", obj.Name, err)
+					return false
+				}
+				return true
+			}
+			nlog.Errorf("node %s hv no domain belonged to", obj.Name)
 		}
+		nlog.Errorf("node %s hv no label about domain", obj.Name)
 	}
+	nlog.Errorf("node %s get labels failed", obj.Name)
 	return false
 }
 
@@ -580,6 +562,12 @@ func (c *Controller) Run(workers int) error {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
+	nlog.Infof("Starting Init LocalNodeStatus")
+	err := c.initLocalNodeStatus()
+	if err != nil {
+		return fmt.Errorf("failed to initLocalNodeStatus")
+	}
+
 	nlog.Info("Starting workers")
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.runWorker, time.Second, c.ctx.Done())
@@ -590,6 +578,73 @@ func (c *Controller) Run(workers int) error {
 	nlog.Info("Starting sync domain status")
 	go wait.Until(c.syncDomainStatuses, 10*time.Second, c.ctx.Done())
 	<-c.ctx.Done()
+	return nil
+}
+
+func (c *Controller) initLocalNodeStatus() error {
+	nodes, err := c.nodeLister.List(labels.Everything())
+	if err != nil {
+		return fmt.Errorf("domain controller init localNodeStatus failed with %v", err)
+	}
+
+	c.nodeStatusesLock.Lock()
+    defer c.nodeStatusesLock.Unlock()
+
+	for _, nodeObj := range nodes {
+		if !c.matchNodeLabels(nodeObj) {
+			continue
+		}
+
+		domainName := nodeObj.Labels[common.LabelNodeNamespace]
+        
+        var totalCPU, totalMem int64
+        pods, _ := c.podLister.Pods(domainName).List(labels.Everything())
+        for _, pod := range pods {
+            if pod.Spec.NodeName == nodeObj.Name {
+                cpu, mem := c.calRequestResource(pod)
+                totalCPU += cpu
+                totalMem += mem
+            }
+        }
+
+		status := LocalNodeStatus{
+            Name:          nodeObj.Name,
+            DomainName:    domainName,
+            TotalCPURequest: totalCPU,
+            TotalMemRequest: totalMem,
+            Status:         nodeStatusNotReady,
+            LastHeartbeatTime:  nodeObj.Status.Conditions[0].LastHeartbeatTime,
+            LastTransitionTime: nodeObj.Status.Conditions[0].LastTransitionTime,
+        }
+
+		for _, cond := range nodeObj.Status.Conditions {
+            if cond.Type == apicorev1.NodeReady {
+                if cond.Status == apicorev1.ConditionTrue {
+                    status.Status = nodeStatusReady
+                }
+                status.LastHeartbeatTime = cond.LastHeartbeatTime
+                status.LastTransitionTime = cond.LastTransitionTime
+                break
+            }
+        }
+
+		c.nodeStatuses = append(c.nodeStatuses, status)
+	}
+
+	for i, status := range c.nodeStatuses {
+		nlog.Debugf("NodeStatus[%d]:\n"+
+			"Name: %s\n"+
+			"Domain: %s\n"+
+			"Status: %s\n"+
+			"LastHeartbeatTime: %s\n" +
+			"LastTransitionTime: %s\n" +
+			"UnreadyReason: %s\n"+
+			"CPU: %d\n"+
+			"Memory: %d",
+			i, status.Name, status.DomainName, status.Status,
+			status.LastHeartbeatTime.Format(time.RFC3339), status.LastTransitionTime.Format(time.RFC3339),
+			status.UnreadyReason, status.TotalCPURequest, status.TotalMemRequest)
+	}
 	return nil
 }
 
