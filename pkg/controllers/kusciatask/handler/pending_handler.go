@@ -232,7 +232,13 @@ func (h *PendingHandler) createTaskResources(kusciaTask *kusciaapisv1alpha1.Kusc
 	for _, partyKitInfo := range selfPartyKitInfos {
 		_, err := h.nodeResourceCheck(*partyKitInfo)
 		if err != nil {
-			nlog.Errorf("domain %s hv no node can satisfy kt %s", partyKitInfo.domainID, partyKitInfo.kusciaTask.Name)
+			nlog.Errorf("domain %s hv no node can satisfy kt %s resource", partyKitInfo.domainID, partyKitInfo.kusciaTask.Name)
+			return err
+		}
+
+		_, cdrErr := h.cdrReadyCheck(*partyKitInfo)
+		if cdrErr != nil {
+			nlog.Errorf("kt %s cdr check failed with %v", partyKitInfo.kusciaTask.Name, cdrErr)
 			return err
 		}
 
@@ -257,6 +263,30 @@ func (h *PendingHandler) createTaskResources(kusciaTask *kusciaapisv1alpha1.Kusc
 		return fmt.Errorf("failed to create task resource group for kuscia task %v, %v", kusciaTask.Name, err.Error())
 	}
 	return nil
+}
+
+func (h *PendingHandler) cdrReadyCheck(partyKitInfo PartyKitInfo) (bool, error) {
+	initiator := partyKitInfo.kusciaTask.Spec.Initiator
+	for _, party := range partyKitInfo.kusciaTask.Spec.Parties {
+		if party.DomainID == initiator {
+			continue
+		}
+
+		cdrName := fmt.Sprintf("%s-%s", initiator, party.DomainID)
+		cdr, err := h.kusciaClient.KusciaV1alpha1().ClusterDomainRoutes().Get(context.Background(), cdrName, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Errorf("get cdr %s failed with %v", cdrName, err)
+		}
+
+		for _, condition := range cdr.Status.Conditions {
+			if condition.Type == kusciaapisv1alpha1.ClusterDomainRouteReady && condition.Status != v1.ConditionTrue {
+				return false, fmt.Errorf("initiator %s to collaborator %s failed with %v", initiator, party.DomainID, err)
+			}
+		}
+	}
+
+	nlog.Infof("initiator %s to collaborator cdr check success for kt %s", initiator, partyKitInfo.kusciaTask.Name)
+	return true, nil
 }
 
 func (h *PendingHandler) nodeResourceCheck(partyKitInfo PartyKitInfo) (bool, error) {
