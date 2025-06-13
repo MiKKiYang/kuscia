@@ -101,7 +101,7 @@ type Controller struct {
 	nodeQueue	          workqueue.RateLimitingInterface
 	recorder              record.EventRecorder
 	cacheSyncs            []cache.InformerSynced
-	nodeStatuses          common.LocalNodeStatuses
+	nodeStatusManager 	  *common.NodeStatusManager
 	nodeStatusesLock      sync.RWMutex
 }
 
@@ -149,6 +149,7 @@ func NewController(ctx context.Context, config controllers.ControllerConfig) con
 		nodeQueue:             workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "node"),
 		recorder:              eventRecorder,
 		cacheSyncs:            cacheSyncs,
+		nodeStatusManager:     common.NewNodeStatusManager(),
 	}
 
 	controller.ctx, controller.cancel = context.WithCancel(ctx)
@@ -266,34 +267,31 @@ func (c *Controller) handlePodCommon(obj interface{}, op string)  {
 }
 
 func (c *Controller) nodeHandler(item *queue.NodeQueueItem) error {
-	c.nodeStatusesLock.Lock()
-	defer c.nodeStatusesLock.Unlock()
+	newStatus := common.LocalNodeStatus{
+		Name:              item.Node.Name,
+		DomainName:        item.Node.Labels[common.LabelNodeNamespace],
+	}
 
-	for i := range c.nodeStatuses {
-		if c.nodeStatuses[i].Name == item.Node.Name {
-			for _, cond := range item.Node.Status.Conditions {
-				if cond.Type == apicorev1.NodeReady {
-					switch cond.Status {
-					case apicorev1.ConditionTrue:
-						c.nodeStatuses[i].Status = nodeStatusReady
-					default:
-						c.nodeStatuses[i].Status = nodeStatusNotReady
-						for _, condReason := range item.Node.Status.Conditions {
-							if condReason.Status == apicorev1.ConditionTrue {
-								c.nodeStatuses[i].UnreadyReason = string(condReason.Type)
-							}
-							break
-						}
+	for _, cond := range item.Node.Status.Conditions {
+		if cond.Type == apicorev1.NodeReady {
+			switch cond.Status {
+			case apicorev1.ConditionTrue:
+				newStatus.Status = nodeStatusReady
+			default:
+				newStatus.Status = nodeStatusNotReady
+				for _, condReason := range item.Node.Status.Conditions {
+					if condReason.Status == apicorev1.ConditionTrue {
+						newStatus.UnreadyReason = string(condReason.Type)
 					}
-					c.nodeStatuses[i].LastHeartbeatTime = cond.LastHeartbeatTime
-					c.nodeStatuses[i].LastTransitionTime = cond.LastTransitionTime
 					break
 				}
 			}
-			return nil
+			newStatus.LastHeartbeatTime = cond.LastHeartbeatTime
+			newStatus.LastTransitionTime = cond.LastTransitionTime
+			break
 		}
 	}
-	return nil
+	return c.nodeStatusManager.UpdateStatus(newStatus)
 }
 
 func (c *Controller) podHandler(item *queue.PodQueueItem) error {
@@ -309,32 +307,12 @@ func (c *Controller) podHandler(item *queue.PodQueueItem) error {
 
 func (c *Controller) addPodHandler(pod *apicorev1.Pod) error {
 	cpuReq, memReq := c.calRequestResource(pod)
-	c.nodeStatusesLock.Lock()
-	defer c.nodeStatusesLock.Unlock()
-
-	for i := range c.nodeStatuses {
-		if c.nodeStatuses[i].Name == pod.Spec.NodeName {
-			c.nodeStatuses[i].TotalCPURequest += cpuReq
-			c.nodeStatuses[i].TotalMemRequest += memReq
-			return nil
-		}
-	}
-	return nil
+	return c.nodeStatusManager.AddPodResources(pod.Spec.NodeName, cpuReq, memReq)
 }
 
 func (c *Controller) deletePodHandler(pod *apicorev1.Pod) error {
 	cpuReq, memReq := c.calRequestResource(pod)
-	c.nodeStatusesLock.Lock()
-	defer c.nodeStatusesLock.Unlock()
-
-	for i := range c.nodeStatuses {
-		if c.nodeStatuses[i].Name == pod.Spec.NodeName {
-			c.nodeStatuses[i].TotalCPURequest -= cpuReq
-			c.nodeStatuses[i].TotalMemRequest -= memReq
-			return nil
-		}
-	}
-	return nil
+	return c.nodeStatusManager.RemovePodResources(pod.Spec.NodeName, cpuReq, memReq)
 }
 
 func (c * Controller) calRequestResource(pod *apicorev1.Pod) (int64, int64) {
@@ -576,6 +554,7 @@ func (c *Controller) initLocalNodeStatus() error {
 	c.nodeStatusesLock.Lock()
     defer c.nodeStatusesLock.Unlock()
 
+	var nodeStatuses []common.LocalNodeStatus
 	for _, nodeObj := range nodes {
 		if !c.matchNodeLabels(nodeObj) {
 			continue
@@ -614,10 +593,12 @@ func (c *Controller) initLocalNodeStatus() error {
             }
         }
 
-		c.nodeStatuses = append(c.nodeStatuses, status)
+		nodeStatuses = append(nodeStatuses, status)
 	}
 
-	for i, status := range c.nodeStatuses {
+	c.nodeStatusManager.ReplaceAll(nodeStatuses)
+
+	for i, status := range c.nodeStatusManager.GetAll() {
 		nlog.Debugf("NodeStatus[%d]:\n"+
 			"Name: %s\n"+
 			"Domain: %s\n"+

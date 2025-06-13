@@ -24,7 +24,6 @@ import (
 
 	"google.golang.org/protobuf/encoding/protojson"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -40,6 +39,11 @@ import (
 	"github.com/secretflow/kuscia/pkg/utils/nlog"
 	utilsres "github.com/secretflow/kuscia/pkg/utils/resources"
 	proto "github.com/secretflow/kuscia/proto/api/v1alpha1/appconfig"
+)
+
+const (
+	nodeStatusReady    = "Ready"
+	nodeStatusNotReady = "NotReady"
 )
 
 // PendingHandler is used to handle kuscia task which phase is pending.
@@ -267,28 +271,34 @@ func (h *PendingHandler) nodeResourceCheck(partyKitInfo PartyKitInfo) (bool, err
 		allContainerMEMRequest += memValue
 	}
 
-	domain, err := h.domainLister.Get(partyKitInfo.domainID)
-	if err != nil {
-		return false, fmt.Errorf("get domain %s failed with %v", partyKitInfo.domainID, err)
-	}
+	nodeStatuses := common.NewNodeStatusManager().GetAll()
 
-	for _, nodeStatus := range domain.Status.NodeStatuses {
-		if nodeStatus.Status == "Ready" {
-			node, err := h.nodeLister.Get(nodeStatus.Name)
-			if err != nil {
-				return false, fmt.Errorf("get node %s failed with %v", nodeStatus.Name, err)
-			}
+	for _, nodeStatus := range nodeStatuses {
+		if nodeStatus.DomainName != partyKitInfo.domainID || nodeStatus.Status != nodeStatusReady {
+			nlog.Errorf("domain %s node %s status is %s", partyKitInfo.domainID, nodeStatus.Name, nodeStatus.Status)
+			continue
+		}
 
-			nodeCPUValue := node.Status.Allocatable.Cpu().MilliValue()
-			nodeMEMValue := node.Status.Allocatable.Memory().Value()
-			if (nodeCPUValue - nodeStatus.TotalCPURequest) > allContainerCPURequest &&
-				(nodeMEMValue - nodeStatus.TotalMemRequest) > allContainerMEMRequest {
-				return true, nil
-			}
+		node, err := h.nodeLister.Get(nodeStatus.Name)
+		if err != nil {
+			nlog.Errorf("get node %s failed with %v", nodeStatus.Name, err)
+			continue
+		}
+
+		nodeCPUValue := node.Status.Allocatable.Cpu().MilliValue()
+		nodeMEMValue := node.Status.Allocatable.Memory().Value()
+
+		if (nodeCPUValue - nodeStatus.TotalCPURequest) > allContainerCPURequest &&
+			(nodeMEMValue - nodeStatus.TotalMemRequest) > allContainerMEMRequest {
+			nlog.Infof("domain %s node %s available resource for kt %s", partyKitInfo.domainID, node.Name, partyKitInfo.kusciaTask.Name)
+			return true, nil
+		} else {
+			nlog.Errorf("domain %s node %s no available resource for kt %s", partyKitInfo.domainID, node.Name, partyKitInfo.kusciaTask.Name)
+			continue
 		}
 	}
 
-	return false, fmt.Errorf("domain %s hv no node can satisfy kt %s", partyKitInfo.domainID, partyKitInfo.kusciaTask.Name)
+	return false, fmt.Errorf("domain %s no available node for kt %s", partyKitInfo.domainID, partyKitInfo.kusciaTask.Name)
 }
 
 func (h *PendingHandler) initPartyTaskStatus(kusciaTask *kusciaapisv1alpha1.KusciaTask, ktStatus *kusciaapisv1alpha1.KusciaTaskStatus) {
